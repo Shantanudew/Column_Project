@@ -11,45 +11,53 @@ st.sidebar.header("Column Geometry & Demand")
 p = st.sidebar.number_input("ETABS Reinforcement % (p)", min_value=0.5, max_value=8.0, value=2.0, step=0.1)
 B = st.sidebar.number_input("Column Width B (mm)", min_value=150, max_value=3000, value=1000, step=25)
 D = st.sidebar.number_input("Column Depth D (mm)", min_value=150, max_value=3000, value=1000, step=25)
-stirrup_dia = st.sidebar.selectbox("Stirrup Diameter (mm)", [8, 10, 12], index=1)
+stirrup_dia = st.sidebar.selectbox("Stirrup Diameter (mm)", [8, 10, 12, 16], index=1)
 cover = st.sidebar.number_input("Clear Cover (mm)", value=40, step=5)
 
 st.sidebar.header("Bar Selection Mode")
 mode = st.sidebar.radio("Optimization Mode", ["Auto-Select Best Bar & Layout", "Manual Bar Selection"])
 
-available_dias = [16, 20, 25, 32]
+available_dias = [12, 16, 20, 25, 32, 40]
 if mode == "Manual Bar Selection":
-    dia_choice = st.sidebar.selectbox("Select Bar Diameter (mm)", available_dias, index=2)
+    dia_choice = st.sidebar.selectbox("Select Bar Diameter (mm)", available_dias, index=3)  # Default 25mm
     candidate_dias = [dia_choice]
 else:
     candidate_dias = available_dias
 
 target_min_s = 55.0
 target_max_s = 75.0
+max_agg_size = 20.0  # Standard 20 mm coarse aggregate
+min_agg_clear_s = (4.0 / 3.0) * max_agg_size  # 26.7 mm (ACI 25.2.3)
 
 # --- STRUCTURAL DEMAND ---
 Ag = B * D
 Ast_req = (p * Ag) / 100.0
 
 # --- CORE SOLVER FUNCTION ---
-def solve_layout(dia, bundled=False):
+def solve_layout(dia, bundled=False, enforce_constructibility=True):
     a_bar = (np.pi * (dia ** 2)) / 4.0
     n_bars_needed = int(np.ceil(Ast_req / a_bar))
     if n_bars_needed < 4:
         n_bars_needed = 4
         
-    # If bundled, each layout station holds 2 bars
     if bundled:
         n_stations_needed = int(np.ceil(n_bars_needed / 2.0))
         if n_stations_needed < 4:
             n_stations_needed = 4
+        # Equivalent diameter per ACI 318-19 Section 25.6.1.5
+        de = np.sqrt(2.0) * dia
+        min_allowable_s = max(de, min_agg_clear_s)
+        min_req_cover = min(de, 50.0)  # ACI 25.6.1.6
     else:
         n_stations_needed = n_bars_needed
+        de = float(dia)
+        min_allowable_s = max(dia, min_agg_clear_s, 25.0)
+        min_req_cover = float(dia)
 
     span_x = B - 2 * (cover + stirrup_dia) - dia
     span_y = D - 2 * (cover + stirrup_dia) - dia
     
-    max_search = max(15, int(np.ceil(n_stations_needed / 2)) + 4)
+    max_search = max(20, int(np.ceil(n_stations_needed / 2)) + 6)
     best = None
     min_penalty = float("inf")
     
@@ -58,117 +66,153 @@ def solve_layout(dia, bundled=False):
             stations = 2 * Nx + 2 * Ny - 4
             if stations >= n_stations_needed:
                 if bundled:
-                    # Clear gap accounts for two bar widths at each station
                     sx = (span_x - (Nx - 1) * (2 * dia)) / (Nx - 1)
                     sy = (span_y - (Ny - 1) * (2 * dia)) / (Ny - 1)
                 else:
                     sx = (span_x - (Nx - 1) * dia) / (Nx - 1)
                     sy = (span_y - (Ny - 1) * dia) / (Ny - 1)
                 
-                if sx <= 0 or sy <= 0:
+                # Check against ACI equivalent diameter spacing limit
+                if sx < min_allowable_s or sy < min_allowable_s:
                     continue
 
                 total_actual_bars = stations * (2 if bundled else 1)
                 
-                spacing_mid = (target_min_s + target_max_s) / 2.0
-                penalty = abs(sx - spacing_mid) + abs(sy - spacing_mid) + (total_actual_bars - n_bars_needed) * 3
-                
-                if target_min_s <= sx <= target_max_s and target_min_s <= sy <= target_max_s:
-                    penalty -= 40.0
-                elif sx < target_min_s or sy < target_min_s:
-                    penalty += 100.0
-                
+                if enforce_constructibility:
+                    spacing_mid = (target_min_s + target_max_s) / 2.0
+                    penalty = abs(sx - spacing_mid) + abs(sy - spacing_mid) + (total_actual_bars - n_bars_needed) * 3
+                    
+                    if target_min_s <= sx <= target_max_s and target_min_s <= sy <= target_max_s:
+                        penalty -= 40.0
+                    elif sx < target_min_s or sy < target_min_s:
+                        penalty += 100.0
+                else:
+                    # Minimum Theoretical Bars Layout
+                    penalty = (total_actual_bars - n_bars_needed) * 1000 + abs(Nx - Ny)
+
                 if penalty < min_penalty:
                     min_penalty = penalty
                     best = {
                         "dia": dia,
                         "bundled": bundled,
+                        "de": de,
+                        "min_allowable_s": min_allowable_s,
+                        "min_req_cover": min_req_cover,
                         "Nx": Nx,
                         "Ny": Ny,
                         "stations": stations,
                         "total_bars": total_actual_bars,
+                        "n_bars_needed": n_bars_needed,
                         "Ast_provided": total_actual_bars * a_bar,
+                        "p_provided": (total_actual_bars * a_bar / Ag) * 100.0,
                         "sx": sx,
                         "sy": sy,
                         "penalty": penalty
                     }
     return best
 
-# --- RUN ENGINE: SINGLE BARS FIRST, BUNDLES ONLY IF NECESSARY ---
-evaluation_pool = []
-
-# 1. Try single bars across allowed diameters
+# --- RUN ENGINE FOR OPTIMIZED LAYOUT ---
+optimized_pool = []
 for d in candidate_dias:
-    res = solve_layout(d, bundled=False)
+    res = solve_layout(d, bundled=False, enforce_constructibility=True)
     if res and res["sx"] >= 40.0 and res["sy"] >= 40.0:
-        evaluation_pool.append(res)
+        optimized_pool.append(res)
 
-# 2. Fallback to bundled bars if single bars do not clear minimum spacing
-if not evaluation_pool:
+if not optimized_pool:
     for d in candidate_dias:
-        res = solve_layout(d, bundled=True)
+        res = solve_layout(d, bundled=True, enforce_constructibility=True)
         if res:
-            evaluation_pool.append(res)
+            optimized_pool.append(res)
 
-# Pick best layout by lowest penalty
-best_layout = min(evaluation_pool, key=lambda x: x["penalty"])
+best_optimized = min(optimized_pool, key=lambda x: x["penalty"])
+active_dia = best_optimized["dia"]
 
-use_Bundle = best_layout["bundled"]
-dia = best_layout["dia"]
+# --- RUN ENGINE FOR THEORETICAL MINIMUM STEEL LAYOUT ---
+min_theory_layout = solve_layout(active_dia, bundled=False, enforce_constructibility=False)
+if min_theory_layout is None:
+    min_theory_layout = solve_layout(active_dia, bundled=True, enforce_constructibility=False)
 
-# --- TIE & CROSSTIE REQUIREMENTS (ACI 318-19 SECTION 25.7.2.3) ---
-aci_threshold = 150.0  # 6-inch limit
-station_width = (2 * dia) if use_Bundle else dia
-
-# Clear distance across an untied (skipped) intermediate station
-s_skip_x = 2 * best_layout["sx"] + station_width
-s_skip_y = 2 * best_layout["sy"] + station_width
-
-# Check if intermediate ties are needed and determine stride
-has_intermediates = (best_layout["Nx"] > 2 or best_layout["Ny"] > 2)
-
-if not has_intermediates:
-    tie_mode = "NONE"
-    stride_x = 0
-    stride_y = 0
-    tie_advice = "Outer Master Tie alone is sufficient (4 corner bars only)."
-elif best_layout["sx"] > aci_threshold or best_layout["sy"] > aci_threshold:
-    tie_mode = "EVERY_BAR"
-    stride_x = 1
-    stride_y = 1
-    tie_advice = "EVERY intermediate bar requires a crosstie leg (adjacent clear spacing > 150 mm)."
-elif s_skip_x > aci_threshold or s_skip_y > aci_threshold:
-    tie_mode = "EVERY_BAR"
-    stride_x = 1
-    stride_y = 1
-    tie_advice = "EVERY intermediate bar requires a crosstie leg (clear distance across skipped bar > 150 mm)."
-else:
-    tie_mode = "ALTERNATE"
-    stride_x = 2
-    stride_y = 2
-    tie_advice = "Alternate bars tied with crossties (clear distance across skipped bar is <= 150 mm)."
-
-# --- DASHBOARD OUTPUT ---
-col1, col2 = st.columns([1.1, 1.2])
+# --- DASHBOARD & LAYOUT SELECTION ---
+col1, col2 = st.columns([1.15, 1.2])
 
 with col1:
     st.subheader("Design Decision Summary")
-    st.markdown(f"**Required Area ($A_{{st}}$):** `{Ast_req:.1f} mm²`")
-    st.markdown(f"**Provided Area:** `{best_layout['Ast_provided']:.1f} mm²` ({best_layout['total_bars']} bars of **#{dia} mm**)")
-    st.markdown(f"**Arrangement Type:** `{'2-Bar Bundles' if use_Bundle else 'Single Regular Bars'}`")
-    st.markdown(f"**Grid Stations:** `{best_layout['Nx']} along B × {best_layout['Ny']} along D`")
+    
+    st.markdown(f"**Required Area ($A_{{st}}$):** `{Ast_req:.1f} mm²` &nbsp;|&nbsp; **Required Steel:** `{p:.2f}%`")
+    st.markdown(f"**Calculated Minimum Bars Needed:** `{best_optimized['n_bars_needed']} bars` of **#{active_dia} mm**")
     
     st.divider()
-    st.subheader("Clear Spacing Status")
-    st.write(f"Clear Gap along Width ($B$): **{best_layout['sx']:.1f} mm**")
-    st.write(f"Clear Gap along Depth ($D$): **{best_layout['sy']:.1f} mm**")
+    st.markdown("#### Layout Options Comparison")
     
-    if target_min_s <= best_layout['sx'] <= target_max_s and target_min_s <= best_layout['sy'] <= target_max_s:
-        st.success("Target spacing achieved (55–75 mm). Optimum constructibility.")
-    elif best_layout['sx'] >= target_min_s and best_layout['sy'] >= target_min_s:
-        st.info("Spacing is clear and open (constructible).")
+    c_opt, c_min = st.columns(2)
+    with c_opt:
+        st.markdown("**Code-Optimized Layout**")
+        st.write(f"Bars: **{best_optimized['total_bars']} bars** ({'2-Bar Bundled' if best_optimized['bundled'] else 'Single'})")
+        st.write(f"Provided: `{best_optimized['Ast_provided']:.1f} mm²` (**{best_optimized['p_provided']:.2f}%**)")
+        st.write(f"Grid: `{best_optimized['Nx']} × {best_optimized['Ny']}`")
+        st.write(f"Clear Gap ($s_x, s_y$): `{best_optimized['sx']:.1f}, {best_optimized['sy']:.1f} mm`")
+
+    with c_min:
+        st.markdown("**Minimum Theory Layout**")
+        st.write(f"Bars: **{min_theory_layout['total_bars']} bars** ({'2-Bar Bundled' if min_theory_layout['bundled'] else 'Single'})")
+        st.write(f"Provided: `{min_theory_layout['Ast_provided']:.1f} mm²` (**{min_theory_layout['p_provided']:.2f}%**)")
+        st.write(f"Grid: `{min_theory_layout['Nx']} × {min_theory_layout['Ny']}`")
+        st.write(f"Clear Gap ($s_x, s_y$): `{min_theory_layout['sx']:.1f}, {min_theory_layout['sy']:.1f} mm`")
+
+    st.divider()
+    view_choice = st.radio(
+        "Display Section in Canvas:",
+        ("Code-Optimized Layout (Constructibility)", "Minimum Theory Layout (Least Steel)"),
+        index=0
+    )
+    
+    active_layout = best_optimized if "Code-Optimized" in view_choice else min_theory_layout
+    use_Bundle = active_layout["bundled"]
+    dia = active_layout["dia"]
+    de = active_layout["de"]
+
+    # --- BUNDLE CHECKS REPORTING (ACI 25.6 & 25.2.3) ---
+    if use_Bundle:
+        st.subheader("Bundling Provisions Audit (ACI 318-19 §25.6)")
+        st.info(f"**Bundle Type:** 2-Bar Bundle | **Equivalent Diameter ($d_e$):** `{de:.1f} mm` (per §25.6.1.5)")
+        st.write(f"Min Permissible Clear Spacing ($s_{{min}} = \\max(d_e, 26.7\\text{{ mm}})$): **{active_layout['min_allowable_s']:.1f} mm**")
+        
+        if cover < active_layout["min_req_cover"]:
+            st.error(
+                f"**Cover Warning (ACI §25.6.1.6):** Specified cover ({cover} mm) is less than required equivalent cover "
+                f"to bundle: min($d_e$, 50 mm) = **{active_layout['min_req_cover']:.1f} mm**. Increase cover in sidebar."
+            )
+        else:
+            st.success(f"**Cover OK (ACI §25.6.1.6):** Specified cover ({cover} mm) $\\ge$ {active_layout['min_req_cover']:.1f} mm.")
+
+    # --- TIE & CROSSTIE REQUIREMENTS (ACI 318 6-INCH RULE) ---
+    aci_threshold = 150.0
+    station_width = (2 * dia) if use_Bundle else dia
+    s_skip_x = 2 * active_layout["sx"] + station_width
+    s_skip_y = 2 * active_layout["sy"] + station_width
+
+    has_intermediates = (active_layout["Nx"] > 2 or active_layout["Ny"] > 2)
+
+    if not has_intermediates:
+        tie_mode = "NONE"
+        stride_x = 0
+        stride_y = 0
+        tie_advice = "Outer Master Tie alone is sufficient (4 corner bars only)."
+    elif active_layout["sx"] > aci_threshold or active_layout["sy"] > aci_threshold:
+        tie_mode = "EVERY_BAR"
+        stride_x = 1
+        stride_y = 1
+        tie_advice = "EVERY intermediate bar requires a crosstie (Adjacent clear spacing > 150 mm)."
+    elif s_skip_x > aci_threshold or s_skip_y > aci_threshold:
+        tie_mode = "EVERY_BAR"
+        stride_x = 1
+        stride_y = 1
+        tie_advice = "EVERY intermediate bar requires a crosstie (Clear distance across skipped bar > 150 mm)."
     else:
-        st.error("Clear spacing tight (< 55 mm).")
+        tie_mode = "ALTERNATE"
+        stride_x = 2
+        stride_y = 2
+        tie_advice = "Alternate bars tied with crossties (Clear distance across skipped bar is <= 150 mm)."
 
     st.subheader("Transverse Ties (ACI 318 6-Inch Rule)")
     st.write(f"Master Tie: **#{stirrup_dia} mm** hoop")
@@ -182,16 +226,16 @@ with col1:
     else:
         st.success(f"Tie Rule: **{tie_advice}**")
 
-# --- CROSS-SECTION PLOT ---
+# --- CROSS-SECTION CANVAS ---
 with col2:
-    st.subheader("Section Cross-Section")
+    st.subheader(f"Cross-Section View: {view_choice.split('(')[0].strip()}")
     fig, ax = plt.subplots(figsize=(7.5, 7.5))
     
     # Concrete Rectangle
     concrete = patches.Rectangle((0, 0), B, D, linewidth=2, edgecolor='black', facecolor='#fbfbfb')
     ax.add_patch(concrete)
     
-    # Master Tie (Outer and Inner thickness lines)
+    # Master Tie
     tie_outer_x = cover
     tie_outer_y = cover
     tie_outer_w = B - 2 * cover
@@ -208,28 +252,26 @@ with col2:
                                   linewidth=1.0, edgecolor='#00529B', facecolor='none', linestyle=':')
     ax.add_patch(inner_tie)
     
-    # Rebar Grid Generation
+    # Rebar Grid Coordinates
     r = dia / 2.0
     x_min = tie_inner_x + r
     x_max = tie_inner_x + tie_inner_w - r
     y_min = tie_inner_y + r
     y_max = tie_inner_y + tie_inner_h - r
     
-    xs = np.linspace(x_min, x_max, best_layout["Nx"])
-    ys = np.linspace(y_min, y_max, best_layout["Ny"])
+    xs = np.linspace(x_min, x_max, active_layout["Nx"])
+    ys = np.linspace(y_min, y_max, active_layout["Ny"])
     
-    # Draw Internal Crossties based on ACI 150 mm spacing stride
+    # Internal Crossties
     if tie_mode in ["ALTERNATE", "EVERY_BAR"]:
-        # Vertical crossties linking Top and Bottom faces
         for i in range(1, len(xs) - 1, stride_x):
             ax.plot([xs[i], xs[i]], [y_min - r, y_max + r], 
                     color='#ff7f0e', linestyle='--', linewidth=1.3, zorder=2)
-        # Horizontal crossties linking Left and Right faces
         for j in range(1, len(ys) - 1, stride_y):
             ax.plot([x_min - r, x_max + r], [ys[j], ys[j]], 
                     color='#ff7f0e', linestyle='--', linewidth=1.3, zorder=2)
 
-    # Position collection
+    # Station coordinates
     stations = []
     for x in xs[1:-1]:
         stations.append((x, y_min, 'bottom'))
@@ -253,7 +295,6 @@ with col2:
             circle = patches.Circle((x, y), r, facecolor='#d62728', edgecolor='black', linewidth=1, zorder=3)
             ax.add_patch(circle)
         else:
-            # 45-degree inward bundles for corners
             if pos == 'corner_bl':
                 c1, c2 = (x, y), (x + diag_shift, y + diag_shift)
             elif pos == 'corner_br':
@@ -262,7 +303,6 @@ with col2:
                 c1, c2 = (x, y), (x + diag_shift, y - diag_shift)
             elif pos == 'corner_tr':
                 c1, c2 = (x, y), (x - diag_shift, y - diag_shift)
-            # Parallel-to-face bundles for perimeters
             elif pos in ['bottom', 'top']:
                 c1, c2 = (x - r, y), (x + r, y)
             elif pos in ['left', 'right']:
