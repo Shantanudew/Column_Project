@@ -9,8 +9,8 @@ st.title("Automated Column Detailing (ETABS to ACI 318 Detail)")
 # --- SIDEBAR INPUTS ---
 st.sidebar.header("Column Geometry & Demand")
 p = st.sidebar.number_input("ETABS Reinforcement % (p)", min_value=0.5, max_value=8.0, value=2.0, step=0.1)
-B = st.sidebar.number_input("Column Width B (mm)", min_value=150, max_value=3000, value=800, step=25)
-D = st.sidebar.number_input("Column Depth D (mm)", min_value=150, max_value=3000, value=1000, step=25)
+B = st.sidebar.number_input("Column Width B (mm)", min_value=150, max_value=3000, value=1400, step=25)
+D = st.sidebar.number_input("Column Depth D (mm)", min_value=150, max_value=3000, value=1500, step=25)
 stirrup_dia = st.sidebar.selectbox("Stirrup Diameter (mm)", [8, 10, 12, 16], index=2)
 cover = st.sidebar.number_input("Clear Cover (mm)", value=40, step=5)
 
@@ -19,7 +19,7 @@ mode = st.sidebar.radio("Optimization Mode", ["Auto-Select Best Bar & Layout", "
 
 available_dias = [12, 16, 20, 25, 32, 40]
 if mode == "Manual Bar Selection":
-    dia_choice = st.sidebar.selectbox("Select Bar Diameter (mm)", available_dias, index=3)  # Default 25mm
+    dia_choice = st.sidebar.selectbox("Select Bar Diameter (mm)", available_dias, index=4)  # Default 32mm
     candidate_dias = [dia_choice]
 else:
     candidate_dias = available_dias
@@ -45,12 +45,12 @@ def solve_layout(dia, bundled=False, enforce_constructibility=True):
         if n_stations_needed < 4:
             n_stations_needed = 4
         de = np.sqrt(2.0) * dia
-        min_allowable_s = max(de, min_agg_clear_s)
-        min_req_cover = min(de, 50.0)
+        min_allowable_s = max(de, min_agg_clear_s, 25.0)
+        min_req_cover = min(de, 50.0)  # ACI 25.6.1.6
     else:
         n_stations_needed = n_bars_needed
         de = float(dia)
-        min_allowable_s = max(dia, min_agg_clear_s, 25.0)
+        min_allowable_s = max(1.5 * dia, min_agg_clear_s, 40.0)
         min_req_cover = float(dia)
 
     span_x = B - 2 * (cover + stirrup_dia) - dia
@@ -71,6 +71,7 @@ def solve_layout(dia, bundled=False, enforce_constructibility=True):
                     sx = (span_x - (Nx - 1) * dia) / (Nx - 1)
                     sy = (span_y - (Ny - 1) * dia) / (Ny - 1)
                 
+                # Spacing limits check
                 if sx < min_allowable_s or sy < min_allowable_s:
                     continue
 
@@ -107,135 +108,131 @@ def solve_layout(dia, bundled=False, enforce_constructibility=True):
                     }
     return best
 
-# --- INTERNAL MULTI-TIER OPTIMIZER ---
-candidate_results = []
+# --- AUTOMATIC REINFORCEMENT SELECTION (SINGLE FIRST -> AUTO BUNDLE FALLBACK) ---
+single_bar_results = []
 for d in candidate_dias:
     raw_layout = solve_layout(d, bundled=False, enforce_constructibility=False)
-    if raw_layout is None:
-        raw_layout = solve_layout(d, bundled=True, enforce_constructibility=False)
-        
-    if raw_layout is not None:
-        sx = raw_layout["sx"]
-        sy = raw_layout["sy"]
-        if 60.0 <= sx <= 150.0 and 60.0 <= sy <= 150.0:
-            candidate_results.append(raw_layout)
-        else:
-            opt_layout = solve_layout(d, bundled=False, enforce_constructibility=True)
-            if opt_layout is None or opt_layout["sx"] < 40.0 or opt_layout["sy"] < 40.0:
-                opt_layout = solve_layout(d, bundled=True, enforce_constructibility=True)
-            if opt_layout is not None:
-                candidate_results.append(opt_layout)
+    if raw_layout is not None and (60.0 <= raw_layout["sx"] <= 150.0 and 60.0 <= raw_layout["sy"] <= 150.0):
+        single_bar_results.append(raw_layout)
+    else:
+        opt_layout = solve_layout(d, bundled=False, enforce_constructibility=True)
+        if opt_layout is not None:
+            single_bar_results.append(opt_layout)
 
-active_layout = min(candidate_results, key=lambda x: x["penalty"])
+if single_bar_results:
+    active_layout = min(single_bar_results, key=lambda x: x["penalty"])
+else:
+    # Single bars cannot fit: automatically fallback to 2-bar bundling
+    bundled_results = []
+    for d in candidate_dias:
+        b_layout = solve_layout(d, bundled=True, enforce_constructibility=True)
+        if b_layout is not None:
+            bundled_results.append(b_layout)
+            
+    if bundled_results:
+        active_layout = min(bundled_results, key=lambda x: x["penalty"])
+    else:
+        active_layout = None
+
+if active_layout is None:
+    st.error("⚠️ Column geometry is too small for the specified reinforcement demand. Please increase dimensions B or D.")
+    st.stop()
+
 use_Bundle = active_layout["bundled"]
 dia = active_layout["dia"]
 de = active_layout["de"]
+Nx = active_layout["Nx"]
+Ny = active_layout["Ny"]
+sx = active_layout["sx"]
+sy = active_layout["sy"]
 
-# --- ACI 318 VERTICAL TIE SPACING (ACI 25.7.2.1) ---
-s_vert_code = min(16 * dia, 48 * stirrup_dia, B, D, 300)
-# Practical rounding down to 25 mm or 50 mm increment
-s_vert_practical = int(np.floor(s_vert_code / 25.0) * 25)
-
-# --- TIE & CROSSTIE REQUIREMENTS (ACI 318 6-INCH RULE) ---
-aci_threshold = 150.0
+# Spacing Pitch
 station_width = (2 * dia) if use_Bundle else dia
-s_skip_x = 2 * active_layout["sx"] + station_width
-s_skip_y = 2 * active_layout["sy"] + station_width
+cc_x = sx + station_width
+cc_y = sy + station_width
 
-has_intermediates = (active_layout["Nx"] > 2 or active_layout["Ny"] > 2)
+# --- UNIVERSAL DETERMINISTIC ALTERNATING SUB-HOOP SCHEDULER ---
+def get_sub_hoop_pairs(N):
+    if N < 6:
+        return []
+    pairs = []
+    left = 2
+    while left < N - 1 - left:
+        right = N - 1 - left
+        pairs.append((left, right))
+        gap = right - left
+        if gap <= 2:
+            break
+        elif gap == 3 or gap == 4:
+            pairs.append((left + 1, right - 1))
+            break
+        left += 2
+    return sorted(list(set(pairs)))
 
-if not has_intermediates:
-    tie_mode = "NONE"
-    stride_x = 0
-    stride_y = 0
-    tie_advice = "Outer Master Tie alone is sufficient."
-elif active_layout["sx"] > aci_threshold or active_layout["sy"] > aci_threshold:
-    tie_mode = "EVERY_BAR"
-    stride_x = 1
-    stride_y = 1
-    tie_advice = "EVERY intermediate bar requires a crosstie (Clear spacing > 150 mm)."
-elif s_skip_x > aci_threshold or s_skip_y > aci_threshold:
-    tie_mode = "EVERY_BAR"
-    stride_x = 1
-    stride_y = 1
-    tie_advice = "EVERY intermediate bar requires a crosstie (Skipped span > 150 mm)."
-else:
-    tie_mode = "ALTERNATE"
-    stride_x = 2
-    stride_y = 2
-    tie_advice = "Alternate bars tied with crossties (Skipped span <= 150 mm)."
+vertical_sub_hoops = get_sub_hoop_pairs(Nx)
+horizontal_sub_hoops = get_sub_hoop_pairs(Ny)
 
-# Center-to-center pitch
-cc_x = active_layout["sx"] + (2 * dia if use_Bundle else dia)
-cc_y = active_layout["sy"] + (2 * dia if use_Bundle else dia)
+# Total closed hoops in set
+total_hoops_count = 1 + len(vertical_sub_hoops) + len(horizontal_sub_hoops)
+tie_callout_image = f"{total_hoops_count} Φ {stirrup_dia}"
 
 # --- UI DASHBOARD ---
-col1, col2 = st.columns([1.1, 1.3])
+col1, col2 = st.columns([1.0, 1.4])
 
 with col1:
     st.subheader("Design Decision Summary")
+    
     st.markdown(f"**Required Steel Area ($A_{{st}}$):** `{Ast_req:.1f} mm²` &nbsp;(**{p:.2f}%**)")
     st.markdown(
         f"**Optimized Provided Area:** `{active_layout['Ast_provided']:.1f} mm²` "
         f"&nbsp;(**{active_layout['p_provided']:.2f}%**)"
     )
+    bundle_label = " (2-Bar Bundled)" if use_Bundle else " (Single Regular Bars)"
     st.markdown(
-        f"**Reinforcement Provided:** **{active_layout['total_bars']} bars** of **#{dia} mm** "
-        f"({'2-Bar Bundled' if use_Bundle else 'Single Regular Bars'})"
+        f"**Reinforcement Provided:** **{active_layout['total_bars']}, {dia} mm Ø @ {int(np.round(cc_x))} mm c/c**{bundle_label}"
     )
-    st.markdown(f"**Arrangement Grid:** `{active_layout['Nx']} (along B) × {active_layout['Ny']} (along D)`")
-    st.markdown(f"**Clear Spacing ($s_x, s_y$):** `{active_layout['sx']:.1f} mm, {active_layout['sy']:.1f} mm`")
-    st.markdown(f"**Center-to-Center Spacing ($c/c_x, c/c_y$):** `{cc_x:.1f} mm, {cc_y:.1f} mm`")
+    st.markdown(f"**Arrangement Grid:** `{Nx} (along B) × {Ny} (along D)`")
+    st.markdown(f"**Clear Spacing ($s_x, s_y$):** `{sx:.1f} mm, {sy:.1f} mm`")
+    st.markdown(f"**Center-to-Center Spacing:** `{cc_x:.1f} mm, {cc_y:.1f} mm`")
 
     if use_Bundle:
         st.divider()
         st.subheader("Bundling Provisions Audit (ACI 318-19 §25.6)")
-        st.info(f"**Bundle Type:** 2-Bar Bundle | **Equivalent Diameter ($d_e$):** `{de:.1f} mm`")
-        st.write(f"Min Allowable Spacing: **{active_layout['min_allowable_s']:.1f} mm**")
+        st.info(f"**Bundle Type:** 2-Bar Bundle | **Equivalent Diameter ($d_e$):** `{de:.1f} mm` (per §25.6.1.5)")
+        st.write(fr"Min Allowable Spacing ($s_{{min}} = \max(d_e, 26.7\text{{ mm}})$): **{active_layout['min_allowable_s']:.1f} mm**")
+        
         if cover < active_layout["min_req_cover"]:
-            st.error(f"**Cover Warning (ACI §25.6.1.6):** Cover ({cover} mm) < required {active_layout['min_req_cover']:.1f} mm.")
+            st.error(
+                f"**Cover Warning (ACI §25.6.1.6):** Specified cover ({cover} mm) < required equivalent cover "
+                f"min($d_e$, 50 mm) = **{active_layout['min_req_cover']:.1f} mm**. Increase cover in sidebar."
+            )
         else:
-            st.success(f"**Cover OK (ACI §25.6.1.6):** Specified cover ({cover} mm) satisfied.")
+            st.success(fr"**Cover OK (ACI §25.6.1.6):** Specified cover ({cover} mm) $\ge$ {active_layout['min_req_cover']:.1f} mm.")
 
-    st.divider()
-    st.subheader("Transverse Confinement & Detailing (ACI 318)")
-    st.write(f"Master Outer Tie: **#{stirrup_dia} mm @ {s_vert_practical} mm c/c**")
-    st.write(f"Crossties / Links: **#{stirrup_dia} mm @ {s_vert_practical} mm c/c**")
-    st.write(f"Vertical Pitch Limit: **{s_vert_practical} mm** (Code Max: {s_vert_code:.0f} mm)")
-    
-    if tie_mode == "EVERY_BAR":
-        st.error(f"Transverse Rule: **{tie_advice}**")
-    elif tie_mode == "ALTERNATE":
-        st.warning(f"Transverse Rule: **{tie_advice}**")
-    else:
-        st.success(f"Transverse Rule: **{tie_advice}**")
-
-# --- CROSS-SECTION & DETAILING CANVAS ---
-# --- CROSS-SECTION & DETAILING CANVAS ---
+# --- CROSS-SECTION CANVAS ---
 with col2:
-    st.subheader("Column Detailing & Schedule View")
-    fig, ax = plt.subplots(figsize=(10, 9))
+    st.subheader("Column Cross-Section View")
+    fig, ax = plt.subplots(figsize=(9, 9))
     
-    # Concrete Cross Section
-    concrete = patches.Rectangle((0, 0), B, D, linewidth=2.5, edgecolor='#1e1e1e', facecolor='#fafafa', zorder=1)
+    # 1. Concrete Outer Rectangle
+    concrete = patches.Rectangle((0, 0), B, D, linewidth=2.2, edgecolor='black', facecolor='white', zorder=1)
     ax.add_patch(concrete)
     
-    # Master Tie
+    # 2. Master Outer Tie (Black)
     tie_ox = cover
     tie_oy = cover
     tie_ow = B - 2 * cover
     tie_oh = D - 2 * cover
     outer_tie = patches.Rectangle((tie_ox, tie_oy), tie_ow, tie_oh,
-                                  linewidth=2.0, edgecolor='#00529B', facecolor='none', zorder=2)
+                                  linewidth=2.0, edgecolor='#000000', facecolor='none', zorder=2)
     ax.add_patch(outer_tie)
 
-    # Master Tie 135 deg seismic hook indicator (Top-Right Corner)
-    hook_len = 6 * stirrup_dia + 20
-    ax.plot([tie_ox + tie_ow - stirrup_dia, tie_ox + tie_ow - hook_len],
-            [tie_oy + tie_oh - stirrup_dia, tie_oy + tie_oh - hook_len],
-            color='#00529B', linewidth=2.0, zorder=2)
+    # Master Tie 135-deg Seismic Hooks (Top-Left Corner)
+    hook_len = max(6 * stirrup_dia, 60)
+    ax.plot([tie_ox + hook_len, tie_ox], [tie_oy + tie_oh - hook_len, tie_oy + tie_oh], color='#000000', linewidth=2.0, zorder=2)
+    ax.plot([tie_ox, tie_ox + hook_len], [tie_oy + tie_oh, tie_oy + tie_oh - hook_len], color='#000000', linewidth=2.0, zorder=2)
 
-    # Coordinates Setup
+    # Rebar Grid Coordinates
     tie_ix = cover + stirrup_dia
     tie_iy = cover + stirrup_dia
     tie_iw = B - 2 * (cover + stirrup_dia)
@@ -247,31 +244,39 @@ with col2:
     y_min = tie_iy + r
     y_max = tie_iy + tie_ih - r
     
-    xs = np.linspace(x_min, x_max, active_layout["Nx"])
-    ys = np.linspace(y_min, y_max, active_layout["Ny"])
-    
-    # Internal Crossties with alternating 90/135 deg end hooks
-    hook_offset = stirrup_dia * 1.5
-    first_tie_x = xs[1] if len(xs) > 2 else xs[0]
-    
-    if tie_mode in ["ALTERNATE", "EVERY_BAR"]:
-        for i in range(1, len(xs) - 1, stride_x):
-            ax.plot([xs[i], xs[i]], [tie_iy, tie_iy + tie_ih], 
-                    color='#d95f02', linestyle='-', linewidth=1.6, zorder=3)
-            ax.plot([xs[i], xs[i] - hook_offset], [tie_iy + tie_ih, tie_iy + tie_ih - hook_offset],
-                    color='#d95f02', linewidth=1.6, zorder=3)
-            ax.plot([xs[i], xs[i] + hook_offset], [tie_iy, tie_iy + hook_offset],
-                    color='#d95f02', linewidth=1.6, zorder=3)
+    xs = np.linspace(x_min, x_max, Nx)
+    ys = np.linspace(y_min, y_max, Ny)
 
-        for j in range(1, len(ys) - 1, stride_y):
-            ax.plot([tie_ix, tie_ix + tie_iw], [ys[j], ys[j]], 
-                    color='#d95f02', linestyle='-', linewidth=1.6, zorder=3)
-            ax.plot([tie_ix + tie_iw, tie_ix + tie_iw - hook_offset], [ys[j], ys[j] - hook_offset],
-                    color='#d95f02', linewidth=1.6, zorder=3)
-            ax.plot([tie_ix, tie_ix + hook_offset], [ys[j], ys[j] + hook_offset],
-                    color='#d95f02', linewidth=1.6, zorder=3)
+    # 3. Interlocking Sub-Hoops with Directional Color Coding
+    target_link_center = None
 
-    # Rebar Stations
+    # Vertical Sub-Hoops (X-Direction - Blue)
+    for (i1, i2) in vertical_sub_hoops:
+        vx = xs[i1] - r - stirrup_dia
+        vw = (xs[i2] + r + stirrup_dia) - vx
+        vy = tie_oy
+        vh = tie_oh
+        rect_v = patches.Rectangle((vx, vy), vw, vh, linewidth=1.6, edgecolor='#00529B', facecolor='none', zorder=3)
+        ax.add_patch(rect_v)
+        # 135-deg seismic hooks
+        ax.plot([vx + 35, vx], [vy + vh - 35, vy + vh], color='#00529B', linewidth=1.6, zorder=3)
+        ax.plot([vx, vx + 35], [vy + vh, vy + vh - 35], color='#00529B', linewidth=1.6, zorder=3)
+        if target_link_center is None:
+            target_link_center = (vx + vw / 2.0, vy + vh * 0.35)
+
+    # Horizontal Sub-Hoops (Y-Direction - Green)
+    for (j1, j2) in horizontal_sub_hoops:
+        hx = tie_ox
+        hw = tie_ow
+        hy = ys[j1] - r - stirrup_dia
+        hh = (ys[j2] + r + stirrup_dia) - hy
+        rect_h = patches.Rectangle((hx, hy), hw, hh, linewidth=1.6, edgecolor='#008000', facecolor='none', zorder=3)
+        ax.add_patch(rect_h)
+        # 135-deg seismic hooks
+        ax.plot([hx + 35, hx], [hy + hh - 35, hy + hh], color='#008000', linewidth=1.6, zorder=3)
+        ax.plot([hx, hx + 35], [hy + hh, hy + hh - 35], color='#008000', linewidth=1.6, zorder=3)
+
+    # 4. Longitudinal Reinforcement Stations
     stations = []
     for x in xs[1:-1]:
         stations.append((x, y_min, 'bottom'))
@@ -289,14 +294,12 @@ with col2:
     stations.extend(corners)
     
     diag_shift = dia / np.sqrt(2)
-    sample_bar_pos = None
+    sample_corner_bar = (x_max, y_max)
 
     for x, y, pos in stations:
         if not use_Bundle:
-            circle = patches.Circle((x, y), r, facecolor='#d62728', edgecolor='black', linewidth=1, zorder=4)
+            circle = patches.Circle((x, y), r, facecolor='black', edgecolor='black', linewidth=1, zorder=5)
             ax.add_patch(circle)
-            if sample_bar_pos is None and pos == 'bottom' and x >= B * 0.45:
-                sample_bar_pos = (x, y)
         else:
             if pos == 'corner_bl':
                 c1, c2 = (x, y), (x + diag_shift, y + diag_shift)
@@ -311,94 +314,62 @@ with col2:
             elif pos in ['left', 'right']:
                 c1, c2 = (x, y - r), (x, y + r)
                 
-            ax.add_patch(patches.Circle(c1, r, facecolor='#d62728', edgecolor='black', linewidth=1, zorder=4))
-            ax.add_patch(patches.Circle(c2, r, facecolor='#d62728', edgecolor='black', linewidth=1, zorder=4))
-            if sample_bar_pos is None and pos == 'bottom' and x >= B * 0.45:
-                sample_bar_pos = c1
+            ax.add_patch(patches.Circle(c1, r, facecolor='black', edgecolor='black', linewidth=1, zorder=5))
+            ax.add_patch(patches.Circle(c2, r, facecolor='black', edgecolor='black', linewidth=1, zorder=5))
 
-    if sample_bar_pos is None:
-        sample_bar_pos = (x_min, y_min)
+    # --- MINIMAL CLEAN CALLOUT LABELS ---
 
-    # --- CLEAR CALLOUT ANNOTATIONS OUTSIDE DRAWING BOUNDARIES ---
-
-    # 1. Longitudinal Bar Tag Callout (Anchored centered below the section)
-    bar_desc = f"{active_layout['total_bars']}-T{dia} ({active_layout['Nx']}-T{dia} @ {cc_x:.0f}mm c/c B-face, {active_layout['Ny']}-T{dia} @ {cc_y:.0f}mm c/c D-face)"
-    if use_Bundle:
-        bar_desc = f"Bundled: {bar_desc}"
-
+    # 1. Top-Right Callout (e.g., "56 Φ 32" or "56 Φ 32 (BUNDLED)")
+    bundle_str_top = " (BUNDLED)" if use_Bundle else ""
+    rebar_callout_top = f"{active_layout['total_bars']} Φ {dia}{bundle_str_top}"
     ax.annotate(
-        bar_desc,
-        xy=sample_bar_pos,
-        xytext=(B / 2.0, -D * 0.22),
-        ha='center',
-        va='top',
-        arrowprops=dict(
-            facecolor='#d62728', edgecolor='#d62728',
-            arrowstyle='->', lw=1.5,
-            connectionstyle="angle,angleA=0,angleB=90,rad=5"
-        ),
-        fontsize=9.0,
+        rebar_callout_top,
+        xy=sample_corner_bar,
+        xytext=(B * 1.05, D * 1.12),
+        arrowprops=dict(arrowstyle='->', color='black', lw=1.2),
+        fontsize=12,
         fontweight='bold',
-        color='#b30000',
-        bbox=dict(boxstyle='round,pad=0.45', facecolor='#fff0f0', edgecolor='#d62728', lw=1.2)
+        color='black'
     )
+    ax.plot([B * 1.03, B * 1.38], [D * 1.09, D * 1.09], color='black', lw=1.2)
 
-    # 2. Master Outer Tie Tag Callout (Anchored strictly to the left exterior)
-    outer_tie_desc = f"Outer Tie:\nT{stirrup_dia} @ {s_vert_practical}mm c/c"
+    # 2. Bottom-Right Stirrup Callout (e.g., "7 Φ 12")
+    if target_link_center is None:
+        target_link_center = (xs[1], ys[Ny // 2])
     ax.annotate(
-        outer_tie_desc,
-        xy=(tie_ox, tie_oy + tie_oh * 0.75),
-        xytext=(-B * 0.20, tie_oy + tie_oh * 0.78),
-        ha='right',
-        va='center',
+        tie_callout_image,
+        xy=target_link_center,
+        xytext=(B * 1.05, D * 0.25),
         arrowprops=dict(
-            facecolor='#00529B', edgecolor='#00529B',
-            arrowstyle='->', lw=1.5,
-            connectionstyle="arc3,rad=0.1"
+            arrowstyle='->',
+            color='black',
+            lw=1.2,
+            connectionstyle="angle,angleA=0,angleB=90,rad=0"
         ),
-        fontsize=9.0,
+        fontsize=12,
         fontweight='bold',
-        color='#003366',
-        bbox=dict(boxstyle='round,pad=0.45', facecolor='#f0f6ff', edgecolor='#00529B', lw=1.2)
+        color='black'
     )
+    ax.plot([B * 1.03, B * 1.35], [D * 0.22, D * 0.22], color='black', lw=1.2)
 
-    # 3. Internal Crosstie Tag Callout (Anchored below the outer tie tag on the left exterior)
-    if tie_mode in ["ALTERNATE", "EVERY_BAR"]:
-        tie_rule_label = "Every Bar Tied" if tie_mode == "EVERY_BAR" else "Alternate Bars Tied"
-        inner_tie_desc = f"Crossties:\nT{stirrup_dia} @ {s_vert_practical}mm c/c\n({tie_rule_label})"
-        ax.annotate(
-            inner_tie_desc,
-            xy=(first_tie_x, tie_iy + tie_ih * 0.45),
-            xytext=(-B * 0.20, tie_iy + tie_ih * 0.35),
-            ha='right',
-            va='center',
-            arrowprops=dict(
-                facecolor='#d95f02', edgecolor='#d95f02',
-                arrowstyle='->', lw=1.5,
-                connectionstyle="arc3,rad=-0.1"
-            ),
-            fontsize=9.0,
-            fontweight='bold',
-            color='#993d00',
-            bbox=dict(boxstyle='round,pad=0.45', facecolor='#fff5eb', edgecolor='#d95f02', lw=1.2)
-        )
+    # 3. Dimension Lines (B and D)
+    dim_off_y = D + D * 0.08
+    dim_off_x = -B * 0.12
+    # B Dimension (Top)
+    ax.annotate('', xy=(0, dim_off_y), xytext=(B, dim_off_y), arrowprops=dict(arrowstyle='-', color='black', lw=1.1))
+    ax.plot([-15, 15], [dim_off_y - 15, dim_off_y + 15], color='black', lw=1.3)
+    ax.plot([B - 15, B + 15], [dim_off_y - 15, dim_off_y + 15], color='black', lw=1.3)
+    ax.text(B / 2.0, dim_off_y + D * 0.03, f"B = {B} mm", ha='center', va='bottom', fontsize=11, fontweight='bold')
 
-    # 4. Dimension Lines for Column Width B & Depth D
-    # Width B Dimension (Top)
-    dim_y = D + D * 0.06
-    ax.annotate('', xy=(0, dim_y), xytext=(B, dim_y),
-                arrowprops=dict(arrowstyle='<->', color='#222222', lw=1.3))
-    ax.text(B / 2.0, dim_y + D * 0.02, f"B = {B} mm", ha='center', va='bottom', fontsize=9.5, fontweight='bold')
+    # D Dimension (Left)
+    ax.annotate('', xy=(dim_off_x, 0), xytext=(dim_off_x, D), arrowprops=dict(arrowstyle='-', color='black', lw=1.1))
+    ax.plot([dim_off_x - 15, dim_off_x + 15], [-15, 15], color='black', lw=1.3)
+    ax.plot([dim_off_x - 15, dim_off_x + 15], [D - 15, D + 15], color='black', lw=1.3)
+    ax.text(dim_off_x - B * 0.04, D / 2.0, f"D = {D} mm", ha='right', va='center', rotation=90, fontsize=11, fontweight='bold')
 
-    # Depth D Dimension (Right)
-    dim_x = B + B * 0.06
-    ax.annotate('', xy=(dim_x, 0), xytext=(dim_x, D),
-                arrowprops=dict(arrowstyle='<->', color='#222222', lw=1.3))
-    ax.text(dim_x + B * 0.025, D / 2.0, f"D = {D} mm", ha='left', va='center', rotation=-90, fontsize=9.5, fontweight='bold')
-
-    # Set canvas boundaries with ample margins so callouts never overlap the column geometry
-    ax.set_xlim(-B * 0.65, B + B * 0.25)
-    ax.set_ylim(-D * 0.32, D + D * 0.16)
+    # Balanced, clean limits
+    ax.set_xlim(-B * 0.25, B * 1.45)
+    ax.set_ylim(-D * 0.10, D * 1.25)
     ax.set_aspect('equal')
     ax.axis('off')
     st.pyplot(fig)
