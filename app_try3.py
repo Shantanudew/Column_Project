@@ -9,8 +9,8 @@ st.title("Automated Column Detailing (ETABS to ACI 318 Detail)")
 # --- SIDEBAR INPUTS ---
 st.sidebar.header("Column Geometry & Demand")
 p = st.sidebar.number_input("ETABS Reinforcement % (p)", min_value=0.5, max_value=8.0, value=2.0, step=0.1)
-B = st.sidebar.number_input("Column Width B (mm)", min_value=150, max_value=3000, value=1400, step=25)
-D = st.sidebar.number_input("Column Depth D (mm)", min_value=150, max_value=3000, value=1500, step=25)
+B = st.sidebar.number_input("Column Width B / Along 3-dir (mm)", min_value=150, max_value=3000, value=1000, step=25)
+D = st.sidebar.number_input("Column Depth D / Along 2-dir (mm)", min_value=150, max_value=3000, value=1000, step=25)
 stirrup_dia = st.sidebar.selectbox("Stirrup Diameter (mm)", [8, 10, 12, 16], index=2)
 cover = st.sidebar.number_input("Clear Cover (mm)", value=40, step=5)
 
@@ -32,6 +32,7 @@ min_agg_clear_s = (4.0 / 3.0) * max_agg_size  # 26.7 mm (ACI 25.2.3)
 # --- STRUCTURAL DEMAND ---
 Ag = B * D
 Ast_req = (p * Ag) / 100.0
+is_square_column = (B == D)
 
 # --- CORE SOLVER FUNCTION ---
 def solve_layout(dia, bundled=False, enforce_constructibility=True):
@@ -44,13 +45,14 @@ def solve_layout(dia, bundled=False, enforce_constructibility=True):
         n_stations_needed = int(np.ceil(n_bars_needed / 2.0))
         if n_stations_needed < 4:
             n_stations_needed = 4
-        de = np.sqrt(2.0) * dia
-        min_allowable_s = max(de, min_agg_clear_s, 25.0)
-        min_req_cover = min(de, 50.0)  # ACI 25.6.1.6
+        # Equivalent diameter per ACI 318-19 Section 25.6.1.5
+        de = np.round(np.sqrt(2.0) * dia, 1)
+        min_allowable_s = max(de, min_agg_clear_s, 50.0)
+        min_req_cover = min(de, 50.0)
     else:
         n_stations_needed = n_bars_needed
         de = float(dia)
-        min_allowable_s = max(1.5 * dia, min_agg_clear_s, 40.0)
+        min_allowable_s = max(1.5 * dia, min_agg_clear_s, 50.0)
         min_req_cover = float(dia)
 
     span_x = B - 2 * (cover + stirrup_dia) - dia
@@ -62,6 +64,10 @@ def solve_layout(dia, bundled=False, enforce_constructibility=True):
     
     for Nx in range(2, max_search):
         for Ny in range(2, max_search):
+            # Enforce strict symmetry for square columns
+            if is_square_column and Nx != Ny:
+                continue
+
             stations = 2 * Nx + 2 * Ny - 4
             if stations >= n_stations_needed:
                 if bundled:
@@ -71,7 +77,7 @@ def solve_layout(dia, bundled=False, enforce_constructibility=True):
                     sx = (span_x - (Nx - 1) * dia) / (Nx - 1)
                     sy = (span_y - (Ny - 1) * dia) / (Ny - 1)
                 
-                # Spacing limits check
+                # Minimum spacing threshold check
                 if sx < min_allowable_s or sy < min_allowable_s:
                     continue
 
@@ -108,7 +114,7 @@ def solve_layout(dia, bundled=False, enforce_constructibility=True):
                     }
     return best
 
-# --- AUTOMATIC REINFORCEMENT SELECTION (SINGLE FIRST -> AUTO BUNDLE FALLBACK) ---
+# --- AUTOMATIC REINFORCEMENT SELECTION ---
 single_bar_results = []
 for d in candidate_dias:
     raw_layout = solve_layout(d, bundled=False, enforce_constructibility=False)
@@ -122,7 +128,6 @@ for d in candidate_dias:
 if single_bar_results:
     active_layout = min(single_bar_results, key=lambda x: x["penalty"])
 else:
-    # Single bars cannot fit: automatically fallback to 2-bar bundling
     bundled_results = []
     for d in candidate_dias:
         b_layout = solve_layout(d, bundled=True, enforce_constructibility=True)
@@ -151,7 +156,12 @@ station_width = (2 * dia) if use_Bundle else dia
 cc_x = sx + station_width
 cc_y = sy + station_width
 
-# --- UNIVERSAL DETERMINISTIC ALTERNATING SUB-HOOP SCHEDULER ---
+# ETABS specific properties
+area_single_bar = int(np.round((np.pi * (dia ** 2)) / 4.0))
+area_etabs_unit = int(np.round(2 * area_single_bar)) if use_Bundle else area_single_bar
+etabs_bar_name = f"{dia}B" if use_Bundle else f"{dia}"
+
+# --- SUB-HOOP SCHEDULER ---
 def get_sub_hoop_pairs(N):
     if N < 6:
         return []
@@ -172,16 +182,14 @@ def get_sub_hoop_pairs(N):
 vertical_sub_hoops = get_sub_hoop_pairs(Nx)
 horizontal_sub_hoops = get_sub_hoop_pairs(Ny)
 
-# Total closed hoops in set
 total_hoops_count = 1 + len(vertical_sub_hoops) + len(horizontal_sub_hoops)
 tie_callout_image = f"{total_hoops_count} Φ {stirrup_dia}"
 
 # --- UI DASHBOARD ---
-col1, col2 = st.columns([1.0, 1.4])
+col1, col2 = st.columns([1.15, 1.25])
 
 with col1:
     st.subheader("Design Decision Summary")
-    
     st.markdown(f"**Required Steel Area ($A_{{st}}$):** `{Ast_req:.1f} mm²` &nbsp;(**{p:.2f}%**)")
     st.markdown(
         f"**Optimized Provided Area:** `{active_layout['Ast_provided']:.1f} mm²` "
@@ -191,23 +199,56 @@ with col1:
     st.markdown(
         f"**Reinforcement Provided:** **{active_layout['total_bars']}, {dia} mm Ø @ {int(np.round(cc_x))} mm c/c**{bundle_label}"
     )
-    st.markdown(f"**Arrangement Grid:** `{Nx} (along B) × {Ny} (along D)`")
     st.markdown(f"**Clear Spacing ($s_x, s_y$):** `{sx:.1f} mm, {sy:.1f} mm`")
     st.markdown(f"**Center-to-Center Spacing:** `{cc_x:.1f} mm, {cc_y:.1f} mm`")
 
-    if use_Bundle:
-        st.divider()
-        st.subheader("Bundling Provisions Audit (ACI 318-19 §25.6)")
-        st.info(f"**Bundle Type:** 2-Bar Bundle | **Equivalent Diameter ($d_e$):** `{de:.1f} mm` (per §25.6.1.5)")
-        st.write(fr"Min Allowable Spacing ($s_{{min}} = \max(d_e, 26.7\text{{ mm}})$): **{active_layout['min_allowable_s']:.1f} mm**")
-        
-        if cover < active_layout["min_req_cover"]:
-            st.error(
-                f"**Cover Warning (ACI §25.6.1.6):** Specified cover ({cover} mm) < required equivalent cover "
-                f"min($d_e$, 50 mm) = **{active_layout['min_req_cover']:.1f} mm**. Increase cover in sidebar."
+    # --- ETABS SECTION DEFINITION PANEL (EXACT DIALOGUE VISIBILITY) ---
+    st.markdown("---")
+    st.markdown("### 📋 ETABS Longitudinal Reinforcing Data")
+    st.caption("Directly input these values into your ETABS Section Designer dialog:")
+
+    with st.container(border=True):
+        st.markdown(
+            f"""
+            <div style="background-color: #f8f9fa; border: 1px solid #d3d3d3; padding: 16px; border-radius: 6px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+                <table style="width: 100%; font-size: 14px; border-collapse: separate; border-spacing: 0 10px;">
+                    <tr>
+                        <td style="color: #212529; width: 62%;"><strong>Number of Longitudinal Bars Along 3-dir Face</strong></td>
+                        <td style="width: 38%;"><input type="text" value="{Nx}" disabled style="width: 100%; padding: 5px 8px; border: 1px solid #ced4da; border-radius: 4px; background-color: #ffffff; color: #212529; font-weight: bold; text-align: right;"></td>
+                    </tr>
+                    <tr>
+                        <td style="color: #212529;"><strong>Number of Longitudinal Bars Along 2-dir Face</strong></td>
+                        <td><input type="text" value="{Ny}" disabled style="width: 100%; padding: 5px 8px; border: 1px solid #ced4da; border-radius: 4px; background-color: #ffffff; color: #212529; font-weight: bold; text-align: right;"></td>
+                    </tr>
+                    <tr>
+                        <td style="color: #212529;"><strong>Longitudinal Bar Size and Area</strong></td>
+                        <td>
+                            <div style="display: flex; gap: 6px;">
+                                <input type="text" value="{etabs_bar_name}" disabled style="width: 45%; padding: 5px 8px; border: 1px solid #ced4da; border-radius: 4px; background-color: #ffffff; color: #212529; font-weight: bold; text-align: center;">
+                                <input type="text" value="{area_etabs_unit} mm²" disabled style="width: 55%; padding: 5px 8px; border: 1px solid #ced4da; border-radius: 4px; background-color: #ffffff; color: #212529; font-weight: bold; text-align: right;">
+                            </div>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="color: #212529;"><strong>Corner Bar Size and Area</strong></td>
+                        <td>
+                            <div style="display: flex; gap: 6px;">
+                                <input type="text" value="{etabs_bar_name}" disabled style="width: 45%; padding: 5px 8px; border: 1px solid #ced4da; border-radius: 4px; background-color: #ffffff; color: #212529; font-weight: bold; text-align: center;">
+                                <input type="text" value="{area_etabs_unit} mm²" disabled style="width: 55%; padding: 5px 8px; border: 1px solid #ced4da; border-radius: 4px; background-color: #ffffff; color: #212529; font-weight: bold; text-align: right;">
+                            </div>
+                        </td>
+                    </tr>
+                </table>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        if use_Bundle:
+            st.info(
+                f"ℹ️ **ETABS Bundling Parameter:** Select equivalent bar **`{etabs_bar_name}`** "
+                f"(Area = **`{area_etabs_unit} mm²`**, $d_e$ = **`{de} mm`**)."
             )
-        else:
-            st.success(fr"**Cover OK (ACI §25.6.1.6):** Specified cover ({cover} mm) $\ge$ {active_layout['min_req_cover']:.1f} mm.")
 
 # --- CROSS-SECTION CANVAS ---
 with col2:
@@ -319,7 +360,7 @@ with col2:
 
     # --- MINIMAL CLEAN CALLOUT LABELS ---
 
-    # 1. Top-Right Callout (e.g., "56 Φ 32" or "56 Φ 32 (BUNDLED)")
+    # 1. Top-Right Callout
     bundle_str_top = " (BUNDLED)" if use_Bundle else ""
     rebar_callout_top = f"{active_layout['total_bars']} Φ {dia}{bundle_str_top}"
     ax.annotate(
@@ -333,7 +374,7 @@ with col2:
     )
     ax.plot([B * 1.03, B * 1.38], [D * 1.09, D * 1.09], color='black', lw=1.2)
 
-    # 2. Bottom-Right Stirrup Callout (e.g., "7 Φ 12")
+    # 2. Bottom-Right Stirrup Callout
     if target_link_center is None:
         target_link_center = (xs[1], ys[Ny // 2])
     ax.annotate(
@@ -367,7 +408,6 @@ with col2:
     ax.plot([dim_off_x - 15, dim_off_x + 15], [D - 15, D + 15], color='black', lw=1.3)
     ax.text(dim_off_x - B * 0.04, D / 2.0, f"D = {D} mm", ha='right', va='center', rotation=90, fontsize=11, fontweight='bold')
 
-    # Balanced, clean limits
     ax.set_xlim(-B * 0.25, B * 1.45)
     ax.set_ylim(-D * 0.10, D * 1.25)
     ax.set_aspect('equal')
