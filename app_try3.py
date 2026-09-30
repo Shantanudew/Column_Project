@@ -19,15 +19,15 @@ mode = st.sidebar.radio("Optimization Mode", ["Auto-Select Best Bar & Layout", "
 
 available_dias = [12, 16, 20, 25, 32, 40]
 if mode == "Manual Bar Selection":
-    dia_choice = st.sidebar.selectbox("Select Bar Diameter (mm)", available_dias, index=4)  # Default 32mm
+    dia_choice = st.sidebar.selectbox("Select Bar Diameter (mm)", available_dias, index=4)
     candidate_dias = [dia_choice]
 else:
     candidate_dias = available_dias
 
 target_min_s = 55.0
 target_max_s = 75.0
-max_agg_size = 20.0  # Standard 20 mm coarse aggregate
-min_agg_clear_s = (4.0 / 3.0) * max_agg_size  # 26.7 mm (ACI 25.2.3)
+max_agg_size = 20.0
+min_agg_clear_s = (4.0 / 3.0) * max_agg_size  # 26.7 mm
 
 # --- STRUCTURAL DEMAND ---
 Ag = B * D
@@ -45,7 +45,6 @@ def solve_layout(dia, bundled=False, enforce_constructibility=True):
         n_stations_needed = int(np.ceil(n_bars_needed / 2.0))
         if n_stations_needed < 4:
             n_stations_needed = 4
-        # Equivalent diameter per ACI 318-19 Section 25.6.1.5
         de = np.round(np.sqrt(2.0) * dia, 1)
         min_allowable_s = max(de, min_agg_clear_s, 50.0)
         min_req_cover = min(de, 50.0)
@@ -64,7 +63,6 @@ def solve_layout(dia, bundled=False, enforce_constructibility=True):
     
     for Nx in range(2, max_search):
         for Ny in range(2, max_search):
-            # Enforce strict symmetry for square columns
             if is_square_column and Nx != Ny:
                 continue
 
@@ -77,7 +75,6 @@ def solve_layout(dia, bundled=False, enforce_constructibility=True):
                     sx = (span_x - (Nx - 1) * dia) / (Nx - 1)
                     sy = (span_y - (Ny - 1) * dia) / (Ny - 1)
                 
-                # Minimum spacing threshold check
                 if sx < min_allowable_s or sy < min_allowable_s:
                     continue
 
@@ -114,7 +111,7 @@ def solve_layout(dia, bundled=False, enforce_constructibility=True):
                     }
     return best
 
-# --- AUTOMATIC REINFORCEMENT SELECTION ---
+# --- REINFORCEMENT OPTIMIZATION ---
 single_bar_results = []
 for d in candidate_dias:
     raw_layout = solve_layout(d, bundled=False, enforce_constructibility=False)
@@ -151,20 +148,34 @@ Ny = active_layout["Ny"]
 sx = active_layout["sx"]
 sy = active_layout["sy"]
 
-# Spacing Pitch
 station_width = (2 * dia) if use_Bundle else dia
 cc_x = sx + station_width
 cc_y = sy + station_width
 
-# ETABS specific properties
 area_single_bar = int(np.round((np.pi * (dia ** 2)) / 4.0))
 area_etabs_unit = int(np.round(2 * area_single_bar)) if use_Bundle else area_single_bar
 etabs_bar_name = f"{dia}B" if use_Bundle else f"{dia}"
 
-# --- SUB-HOOP SCHEDULER ---
+# --- COMPREHENSIVE ACI 318-19 SUB-HOOP SCHEDULER (ALL SIZES N >= 3) ---
 def get_sub_hoop_pairs(N):
-    if N < 6:
+    """
+    Computes closed sub-hoop bar pairings across N stations ensuring:
+    1. Alternating support rule (no two consecutive unbraced bars).
+    2. Works for any N (from 3 stations up to any column dimension).
+    """
+    if N <= 2:
         return []
+    if N == 3:
+        # 1 intermediate bar (index 1) - single tie / crosstie across station 1
+        return [(1, 1)]
+    if N == 4:
+        # 2 intermediate bars (indices 1, 2) - hoop engaging both stations
+        return [(1, 2)]
+    if N == 5:
+        # 3 intermediate bars (indices 1, 2, 3) - hoop engaging outer pair 1 and 3 (supports S-U-S)
+        return [(1, 3)]
+    
+    # For N >= 6: Interlocking symmetric loops
     pairs = []
     left = 2
     while left < N - 1 - left:
@@ -173,10 +184,15 @@ def get_sub_hoop_pairs(N):
         gap = right - left
         if gap <= 2:
             break
-        elif gap == 3 or gap == 4:
+        elif gap in [3, 4]:
             pairs.append((left + 1, right - 1))
             break
         left += 2
+    
+    # If N is even and left is right adjacent
+    if not pairs and N >= 6:
+        pairs.append((1, N - 2))
+        
     return sorted(list(set(pairs)))
 
 vertical_sub_hoops = get_sub_hoop_pairs(Nx)
@@ -202,7 +218,7 @@ with col1:
     st.markdown(f"**Clear Spacing ($s_x, s_y$):** `{sx:.1f} mm, {sy:.1f} mm`")
     st.markdown(f"**Center-to-Center Spacing:** `{cc_x:.1f} mm, {cc_y:.1f} mm`")
 
-    # --- ETABS SECTION DEFINITION PANEL (EXACT DIALOGUE VISIBILITY) ---
+    # --- ETABS SECTION DEFINITION PANEL ---
     st.markdown("---")
     st.markdown("### 📋 ETABS Longitudinal Reinforcing Data")
     st.caption("Directly input these values into your ETABS Section Designer dialog:")
@@ -268,7 +284,7 @@ with col2:
                                   linewidth=2.0, edgecolor='#000000', facecolor='none', zorder=2)
     ax.add_patch(outer_tie)
 
-    # Master Tie 135-deg Seismic Hooks (Top-Left Corner)
+    # Master Tie 135-deg Seismic Hooks
     hook_len = max(6 * stirrup_dia, 60)
     ax.plot([tie_ox + hook_len, tie_ox], [tie_oy + tie_oh - hook_len, tie_oy + tie_oh], color='#000000', linewidth=2.0, zorder=2)
     ax.plot([tie_ox, tie_ox + hook_len], [tie_oy + tie_oh, tie_oy + tie_oh - hook_len], color='#000000', linewidth=2.0, zorder=2)
@@ -291,31 +307,47 @@ with col2:
     # 3. Interlocking Sub-Hoops with Directional Color Coding
     target_link_center = None
 
-    # Vertical Sub-Hoops (X-Direction - Blue)
+    # Vertical Sub-Hoops (X-Direction Restraint - Blue)
     for (i1, i2) in vertical_sub_hoops:
-        vx = xs[i1] - r - stirrup_dia
-        vw = (xs[i2] + r + stirrup_dia) - vx
-        vy = tie_oy
-        vh = tie_oh
-        rect_v = patches.Rectangle((vx, vy), vw, vh, linewidth=1.6, edgecolor='#00529B', facecolor='none', zorder=3)
-        ax.add_patch(rect_v)
-        # 135-deg seismic hooks
-        ax.plot([vx + 35, vx], [vy + vh - 35, vy + vh], color='#00529B', linewidth=1.6, zorder=3)
-        ax.plot([vx, vx + 35], [vy + vh, vy + vh - 35], color='#00529B', linewidth=1.6, zorder=3)
-        if target_link_center is None:
-            target_link_center = (vx + vw / 2.0, vy + vh * 0.35)
+        if i1 == i2:
+            # Single vertical crosstie
+            cx = xs[i1]
+            ax.plot([cx, cx], [tie_oy, tie_oy + tie_oh], color='#00529B', linewidth=1.6, zorder=3)
+            ax.plot([cx - 25, cx], [tie_oy + tie_oh - 25, tie_oy + tie_oh], color='#00529B', linewidth=1.6, zorder=3)
+            ax.plot([cx, cx + 25], [tie_oy, tie_oy + 25], color='#00529B', linewidth=1.6, zorder=3)
+            if target_link_center is None:
+                target_link_center = (cx, tie_oy + tie_oh * 0.35)
+        else:
+            # Closed rectangular sub-hoop
+            vx = xs[i1] - r - stirrup_dia
+            vw = (xs[i2] + r + stirrup_dia) - vx
+            vy = tie_oy
+            vh = tie_oh
+            rect_v = patches.Rectangle((vx, vy), vw, vh, linewidth=1.6, edgecolor='#00529B', facecolor='none', zorder=3)
+            ax.add_patch(rect_v)
+            ax.plot([vx + 35, vx], [vy + vh - 35, vy + vh], color='#00529B', linewidth=1.6, zorder=3)
+            ax.plot([vx, vx + 35], [vy + vh, vy + vh - 35], color='#00529B', linewidth=1.6, zorder=3)
+            if target_link_center is None:
+                target_link_center = (vx + vw / 2.0, vy + vh * 0.35)
 
-    # Horizontal Sub-Hoops (Y-Direction - Green)
+    # Horizontal Sub-Hoops (Y-Direction Restraint - Green)
     for (j1, j2) in horizontal_sub_hoops:
-        hx = tie_ox
-        hw = tie_ow
-        hy = ys[j1] - r - stirrup_dia
-        hh = (ys[j2] + r + stirrup_dia) - hy
-        rect_h = patches.Rectangle((hx, hy), hw, hh, linewidth=1.6, edgecolor='#008000', facecolor='none', zorder=3)
-        ax.add_patch(rect_h)
-        # 135-deg seismic hooks
-        ax.plot([hx + 35, hx], [hy + hh - 35, hy + hh], color='#008000', linewidth=1.6, zorder=3)
-        ax.plot([hx, hx + 35], [hy + hh, hy + hh - 35], color='#008000', linewidth=1.6, zorder=3)
+        if j1 == j2:
+            # Single horizontal crosstie
+            cy = ys[j1]
+            ax.plot([tie_ox, tie_ox + tie_ow], [cy, cy], color='#008000', linewidth=1.6, zorder=3)
+            ax.plot([tie_ox + 25, tie_ox], [cy + 25, cy], color='#008000', linewidth=1.6, zorder=3)
+            ax.plot([tie_ox + tie_ow - 25, tie_ox + tie_ow], [cy, cy - 25], color='#008000', linewidth=1.6, zorder=3)
+        else:
+            # Closed rectangular sub-hoop
+            hx = tie_ox
+            hw = tie_ow
+            hy = ys[j1] - r - stirrup_dia
+            hh = (ys[j2] + r + stirrup_dia) - hy
+            rect_h = patches.Rectangle((hx, hy), hw, hh, linewidth=1.6, edgecolor='#008000', facecolor='none', zorder=3)
+            ax.add_patch(rect_h)
+            ax.plot([hx + 35, hx], [hy + hh - 35, hy + hh], color='#008000', linewidth=1.6, zorder=3)
+            ax.plot([hx, hx + 35], [hy + hh, hy + hh - 35], color='#008000', linewidth=1.6, zorder=3)
 
     # 4. Longitudinal Reinforcement Stations
     stations = []
@@ -374,9 +406,9 @@ with col2:
     )
     ax.plot([B * 1.03, B * 1.38], [D * 1.09, D * 1.09], color='black', lw=1.2)
 
-    # 2. Bottom-Right Stirrup Callout
+    # 2. Stirrup Callout
     if target_link_center is None:
-        target_link_center = (xs[1], ys[Ny // 2])
+        target_link_center = (xs[Nx // 2], ys[Ny // 2])
     ax.annotate(
         tie_callout_image,
         xy=target_link_center,
