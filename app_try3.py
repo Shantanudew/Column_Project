@@ -1,7 +1,9 @@
-import streamlit as st
-import numpy as np
+import matplotlib
+matplotlib.use("Agg")  # CRITICAL: Fixes headless server hang on Streamlit Cloud
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import streamlit as st
+import numpy as np
 
 st.set_page_config(page_title="Column Rebar Detailer", layout="wide")
 st.title("Automated Column Detailing (ETABS to ACI 318 Detail)")
@@ -155,7 +157,7 @@ area_single_bar = int(np.round((np.pi * (dia ** 2)) / 4.0))
 area_etabs_unit = int(np.round(2 * area_single_bar)) if use_Bundle else area_single_bar
 etabs_bar_name = f"{dia}B" if use_Bundle else f"{dia}"
 
-# --- SAFE DETERMINISTIC SUB-HOOP SCHEDULER (CANNOT INFINITE LOOP) ---
+# --- SAFE DETERMINISTIC SUB-HOOP SCHEDULER ---
 def get_sub_hoop_pairs(N):
     if N <= 2:
         return []
@@ -408,4 +410,4 @@ with col2:
     ax.axis('off')
     
     st.pyplot(fig)
-    plt.close(fig)  # Release thread cache and prevent cloud hangs
+    plt.close(fig)  # Crucial to release thread memory
