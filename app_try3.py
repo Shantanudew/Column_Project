@@ -24,8 +24,10 @@ if mode == "Manual Bar Selection":
 else:
     candidate_dias = available_dias
 
-target_min_s = 55.0
-target_max_s = 75.0
+HARD_MIN_SPACING = 50.0
+HARD_MAX_SPACING = 150.0
+TARGET_IDEAL_SPACING = 75.0
+
 max_agg_size = 20.0
 min_agg_clear_s = (4.0 / 3.0) * max_agg_size  # 26.7 mm
 
@@ -34,8 +36,8 @@ Ag = B * D
 Ast_req = (p * Ag) / 100.0
 is_square_column = (B == D)
 
-# --- CORE SOLVER FUNCTION ---
-def solve_layout(dia, bundled=False, enforce_constructibility=True):
+# --- DETERMINISTIC SOLVER FUNCTION ---
+def solve_layout(dia, bundled=False):
     a_bar = (np.pi * (dia ** 2)) / 4.0
     n_bars_needed = int(np.ceil(Ast_req / a_bar))
     if n_bars_needed < 4:
@@ -46,18 +48,18 @@ def solve_layout(dia, bundled=False, enforce_constructibility=True):
         if n_stations_needed < 4:
             n_stations_needed = 4
         de = np.round(np.sqrt(2.0) * dia, 1)
-        min_allowable_s = max(de, min_agg_clear_s, 50.0)
+        min_allowable_s = max(de, min_agg_clear_s, HARD_MIN_SPACING)
         min_req_cover = min(de, 50.0)
     else:
         n_stations_needed = n_bars_needed
         de = float(dia)
-        min_allowable_s = max(1.5 * dia, min_agg_clear_s, 50.0)
+        min_allowable_s = max(1.5 * dia, min_agg_clear_s, HARD_MIN_SPACING)
         min_req_cover = float(dia)
 
     span_x = B - 2 * (cover + stirrup_dia) - dia
     span_y = D - 2 * (cover + stirrup_dia) - dia
-    
-    max_search = max(20, int(np.ceil(n_stations_needed / 2)) + 6)
+
+    max_search = max(25, int(np.ceil(n_stations_needed / 2)) + 6)
     best = None
     min_penalty = float("inf")
     
@@ -75,24 +77,26 @@ def solve_layout(dia, bundled=False, enforce_constructibility=True):
                     sx = (span_x - (Nx - 1) * dia) / (Nx - 1)
                     sy = (span_y - (Ny - 1) * dia) / (Ny - 1)
                 
+                # Hard Spacing Limits
                 if sx < min_allowable_s or sy < min_allowable_s:
+                    continue
+                if sx > HARD_MAX_SPACING or sy > HARD_MAX_SPACING:
                     continue
 
                 total_actual_bars = stations * (2 if bundled else 1)
-                
-                if enforce_constructibility:
-                    spacing_mid = (target_min_s + target_max_s) / 2.0
-                    penalty = abs(sx - spacing_mid) + abs(sy - spacing_mid) + (total_actual_bars - n_bars_needed) * 3
-                    
-                    if target_min_s <= sx <= target_max_s and target_min_s <= sy <= target_max_s:
-                        penalty -= 40.0
-                    elif sx < target_min_s or sy < target_min_s:
-                        penalty += 100.0
-                else:
-                    penalty = (total_actual_bars - n_bars_needed) * 1000 + abs(Nx - Ny)
+                Ast_provided = total_actual_bars * a_bar
+                p_provided = (Ast_provided / Ag) * 100.0
 
-                if penalty < min_penalty:
-                    min_penalty = penalty
+                # Economy & Constructibility Penalty
+                excess_steel_ratio = (Ast_provided - Ast_req) / Ast_req
+                cost_excess_steel = excess_steel_ratio * 1000.0
+                cost_spacing = abs(sx - TARGET_IDEAL_SPACING) + abs(sy - TARGET_IDEAL_SPACING)
+                cost_ratio = abs((Nx / Ny) - (B / D)) * 15.0
+
+                total_penalty = cost_excess_steel + cost_spacing + cost_ratio
+
+                if total_penalty < min_penalty:
+                    min_penalty = total_penalty
                     best = {
                         "dia": dia,
                         "bundled": bundled,
@@ -103,41 +107,36 @@ def solve_layout(dia, bundled=False, enforce_constructibility=True):
                         "Ny": Ny,
                         "stations": stations,
                         "total_bars": total_actual_bars,
-                        "Ast_provided": total_actual_bars * a_bar,
-                        "p_provided": (total_actual_bars * a_bar / Ag) * 100.0,
+                        "Ast_provided": Ast_provided,
+                        "p_provided": p_provided,
                         "sx": sx,
                         "sy": sy,
-                        "penalty": penalty
+                        "penalty": total_penalty
                     }
     return best
 
-# --- REINFORCEMENT OPTIMIZATION ---
+# --- REINFORCEMENT OPTIMIZATION PIPELINE ---
 single_bar_results = []
 for d in candidate_dias:
-    raw_layout = solve_layout(d, bundled=False, enforce_constructibility=False)
-    if raw_layout is not None and (60.0 <= raw_layout["sx"] <= 150.0 and 60.0 <= raw_layout["sy"] <= 150.0):
-        single_bar_results.append(raw_layout)
-    else:
-        opt_layout = solve_layout(d, bundled=False, enforce_constructibility=True)
-        if opt_layout is not None:
-            single_bar_results.append(opt_layout)
+    res = solve_layout(d, bundled=False)
+    if res is not None:
+        single_bar_results.append(res)
 
 if single_bar_results:
     active_layout = min(single_bar_results, key=lambda x: x["penalty"])
 else:
     bundled_results = []
     for d in candidate_dias:
-        b_layout = solve_layout(d, bundled=True, enforce_constructibility=True)
-        if b_layout is not None:
-            bundled_results.append(b_layout)
-            
+        b_res = solve_layout(d, bundled=True)
+        if b_res is not None:
+            bundled_results.append(b_res)
     if bundled_results:
         active_layout = min(bundled_results, key=lambda x: x["penalty"])
     else:
         active_layout = None
 
 if active_layout is None:
-    st.error("⚠️ Column geometry is too small for the specified reinforcement demand. Please increase dimensions B or D.")
+    st.error("⚠️ Column geometry cannot accommodate reinforcement demand within spacing limits (50 mm - 150 mm). Please increase B or D.")
     st.stop()
 
 use_Bundle = active_layout["bundled"]
@@ -156,41 +155,24 @@ area_single_bar = int(np.round((np.pi * (dia ** 2)) / 4.0))
 area_etabs_unit = int(np.round(2 * area_single_bar)) if use_Bundle else area_single_bar
 etabs_bar_name = f"{dia}B" if use_Bundle else f"{dia}"
 
-# --- COMPREHENSIVE ACI 318-19 SUB-HOOP SCHEDULER (ALL SIZES N >= 3) ---
+# --- SAFE DETERMINISTIC SUB-HOOP SCHEDULER (CANNOT INFINITE LOOP) ---
 def get_sub_hoop_pairs(N):
-    """
-    Computes closed sub-hoop bar pairings across N stations ensuring:
-    1. Alternating support rule (no two consecutive unbraced bars).
-    2. Works for any N (from 3 stations up to any column dimension).
-    """
     if N <= 2:
         return []
     if N == 3:
-        # 1 intermediate bar (index 1) - single tie / crosstie across station 1
         return [(1, 1)]
     if N == 4:
-        # 2 intermediate bars (indices 1, 2) - hoop engaging both stations
         return [(1, 2)]
     if N == 5:
-        # 3 intermediate bars (indices 1, 2, 3) - hoop engaging outer pair 1 and 3 (supports S-U-S)
         return [(1, 3)]
     
-    # For N >= 6: Interlocking symmetric loops
     pairs = []
-    left = 2
-    while left < N - 1 - left:
+    for left in range(2, N // 2 + 1, 2):
         right = N - 1 - left
-        pairs.append((left, right))
-        gap = right - left
-        if gap <= 2:
-            break
-        elif gap in [3, 4]:
-            pairs.append((left + 1, right - 1))
-            break
-        left += 2
-    
-    # If N is even and left is right adjacent
-    if not pairs and N >= 6:
+        if left <= right:
+            pairs.append((left, right))
+            
+    if not pairs:
         pairs.append((1, N - 2))
         
     return sorted(list(set(pairs)))
@@ -218,7 +200,6 @@ with col1:
     st.markdown(f"**Clear Spacing ($s_x, s_y$):** `{sx:.1f} mm, {sy:.1f} mm`")
     st.markdown(f"**Center-to-Center Spacing:** `{cc_x:.1f} mm, {cc_y:.1f} mm`")
 
-    # --- ETABS SECTION DEFINITION PANEL ---
     st.markdown("---")
     st.markdown("### 📋 ETABS Longitudinal Reinforcing Data")
     st.caption("Directly input these values into your ETABS Section Designer dialog:")
@@ -271,11 +252,9 @@ with col2:
     st.subheader("Column Cross-Section View")
     fig, ax = plt.subplots(figsize=(9, 9))
     
-    # 1. Concrete Outer Rectangle
     concrete = patches.Rectangle((0, 0), B, D, linewidth=2.2, edgecolor='black', facecolor='white', zorder=1)
     ax.add_patch(concrete)
     
-    # 2. Master Outer Tie (Black)
     tie_ox = cover
     tie_oy = cover
     tie_ow = B - 2 * cover
@@ -284,12 +263,10 @@ with col2:
                                   linewidth=2.0, edgecolor='#000000', facecolor='none', zorder=2)
     ax.add_patch(outer_tie)
 
-    # Master Tie 135-deg Seismic Hooks
     hook_len = max(6 * stirrup_dia, 60)
     ax.plot([tie_ox + hook_len, tie_ox], [tie_oy + tie_oh - hook_len, tie_oy + tie_oh], color='#000000', linewidth=2.0, zorder=2)
     ax.plot([tie_ox, tie_ox + hook_len], [tie_oy + tie_oh, tie_oy + tie_oh - hook_len], color='#000000', linewidth=2.0, zorder=2)
 
-    # Rebar Grid Coordinates
     tie_ix = cover + stirrup_dia
     tie_iy = cover + stirrup_dia
     tie_iw = B - 2 * (cover + stirrup_dia)
@@ -304,13 +281,10 @@ with col2:
     xs = np.linspace(x_min, x_max, Nx)
     ys = np.linspace(y_min, y_max, Ny)
 
-    # 3. Interlocking Sub-Hoops with Directional Color Coding
     target_link_center = None
 
-    # Vertical Sub-Hoops (X-Direction Restraint - Blue)
     for (i1, i2) in vertical_sub_hoops:
         if i1 == i2:
-            # Single vertical crosstie
             cx = xs[i1]
             ax.plot([cx, cx], [tie_oy, tie_oy + tie_oh], color='#00529B', linewidth=1.6, zorder=3)
             ax.plot([cx - 25, cx], [tie_oy + tie_oh - 25, tie_oy + tie_oh], color='#00529B', linewidth=1.6, zorder=3)
@@ -318,7 +292,6 @@ with col2:
             if target_link_center is None:
                 target_link_center = (cx, tie_oy + tie_oh * 0.35)
         else:
-            # Closed rectangular sub-hoop
             vx = xs[i1] - r - stirrup_dia
             vw = (xs[i2] + r + stirrup_dia) - vx
             vy = tie_oy
@@ -330,16 +303,13 @@ with col2:
             if target_link_center is None:
                 target_link_center = (vx + vw / 2.0, vy + vh * 0.35)
 
-    # Horizontal Sub-Hoops (Y-Direction Restraint - Green)
     for (j1, j2) in horizontal_sub_hoops:
         if j1 == j2:
-            # Single horizontal crosstie
             cy = ys[j1]
             ax.plot([tie_ox, tie_ox + tie_ow], [cy, cy], color='#008000', linewidth=1.6, zorder=3)
             ax.plot([tie_ox + 25, tie_ox], [cy + 25, cy], color='#008000', linewidth=1.6, zorder=3)
             ax.plot([tie_ox + tie_ow - 25, tie_ox + tie_ow], [cy, cy - 25], color='#008000', linewidth=1.6, zorder=3)
         else:
-            # Closed rectangular sub-hoop
             hx = tie_ox
             hw = tie_ow
             hy = ys[j1] - r - stirrup_dia
@@ -349,7 +319,6 @@ with col2:
             ax.plot([hx + 35, hx], [hy + hh - 35, hy + hh], color='#008000', linewidth=1.6, zorder=3)
             ax.plot([hx, hx + 35], [hy + hh, hy + hh - 35], color='#008000', linewidth=1.6, zorder=3)
 
-    # 4. Longitudinal Reinforcement Stations
     stations = []
     for x in xs[1:-1]:
         stations.append((x, y_min, 'bottom'))
@@ -390,9 +359,6 @@ with col2:
             ax.add_patch(patches.Circle(c1, r, facecolor='black', edgecolor='black', linewidth=1, zorder=5))
             ax.add_patch(patches.Circle(c2, r, facecolor='black', edgecolor='black', linewidth=1, zorder=5))
 
-    # --- MINIMAL CLEAN CALLOUT LABELS ---
-
-    # 1. Top-Right Callout
     bundle_str_top = " (BUNDLED)" if use_Bundle else ""
     rebar_callout_top = f"{active_layout['total_bars']} Φ {dia}{bundle_str_top}"
     ax.annotate(
@@ -406,7 +372,6 @@ with col2:
     )
     ax.plot([B * 1.03, B * 1.38], [D * 1.09, D * 1.09], color='black', lw=1.2)
 
-    # 2. Stirrup Callout
     if target_link_center is None:
         target_link_center = (xs[Nx // 2], ys[Ny // 2])
     ax.annotate(
@@ -425,16 +390,13 @@ with col2:
     )
     ax.plot([B * 1.03, B * 1.35], [D * 0.22, D * 0.22], color='black', lw=1.2)
 
-    # 3. Dimension Lines (B and D)
     dim_off_y = D + D * 0.08
     dim_off_x = -B * 0.12
-    # B Dimension (Top)
     ax.annotate('', xy=(0, dim_off_y), xytext=(B, dim_off_y), arrowprops=dict(arrowstyle='-', color='black', lw=1.1))
     ax.plot([-15, 15], [dim_off_y - 15, dim_off_y + 15], color='black', lw=1.3)
     ax.plot([B - 15, B + 15], [dim_off_y - 15, dim_off_y + 15], color='black', lw=1.3)
     ax.text(B / 2.0, dim_off_y + D * 0.03, f"B = {B} mm", ha='center', va='bottom', fontsize=11, fontweight='bold')
 
-    # D Dimension (Left)
     ax.annotate('', xy=(dim_off_x, 0), xytext=(dim_off_x, D), arrowprops=dict(arrowstyle='-', color='black', lw=1.1))
     ax.plot([dim_off_x - 15, dim_off_x + 15], [-15, 15], color='black', lw=1.3)
     ax.plot([dim_off_x - 15, dim_off_x + 15], [D - 15, D + 15], color='black', lw=1.3)
@@ -444,4 +406,6 @@ with col2:
     ax.set_ylim(-D * 0.10, D * 1.25)
     ax.set_aspect('equal')
     ax.axis('off')
+    
     st.pyplot(fig)
+    plt.close(fig)  # Release thread cache and prevent cloud hangs
