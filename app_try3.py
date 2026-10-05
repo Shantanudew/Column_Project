@@ -44,7 +44,7 @@ def solve_layout(dia, bundled=False):
     n_bars_needed = int(np.ceil(Ast_req / a_bar))
     if n_bars_needed < 4:
         n_bars_needed = 4
-        
+
     if bundled:
         n_stations_needed = int(np.ceil(n_bars_needed / 2.0))
         if n_stations_needed < 4:
@@ -64,7 +64,7 @@ def solve_layout(dia, bundled=False):
     max_search = max(25, int(np.ceil(n_stations_needed / 2)) + 6)
     best = None
     min_penalty = float("inf")
-    
+
     for Nx in range(2, max_search):
         for Ny in range(2, max_search):
             if is_square_column and Nx != Ny:
@@ -78,7 +78,7 @@ def solve_layout(dia, bundled=False):
                 else:
                     sx = (span_x - (Nx - 1) * dia) / (Nx - 1)
                     sy = (span_y - (Ny - 1) * dia) / (Ny - 1)
-                
+
                 # Hard Spacing Limits
                 if sx < min_allowable_s or sy < min_allowable_s:
                     continue
@@ -138,7 +138,7 @@ else:
         active_layout = None
 
 if active_layout is None:
-    st.error("⚠️ Column geometry cannot accommodate reinforcement demand within spacing limits (50 mm - 150 mm). Please increase B or D.")
+    st.error("Column geometry cannot accommodate reinforcement demand within spacing limits (50 mm - 150 mm). Please increase B or D.")
     st.stop()
 
 use_Bundle = active_layout["bundled"]
@@ -167,16 +167,16 @@ def get_sub_hoop_pairs(N):
         return [(1, 2)]
     if N == 5:
         return [(1, 3)]
-    
+
     pairs = []
     for left in range(2, N // 2 + 1, 2):
         right = N - 1 - left
         if left <= right:
             pairs.append((left, right))
-            
+
     if not pairs:
         pairs.append((1, N - 2))
-        
+
     return sorted(list(set(pairs)))
 
 vertical_sub_hoops = get_sub_hoop_pairs(Nx)
@@ -253,10 +253,10 @@ with col1:
 with col2:
     st.subheader("Column Cross-Section View")
     fig, ax = plt.subplots(figsize=(9, 9))
-    
+
     concrete = patches.Rectangle((0, 0), B, D, linewidth=2.2, edgecolor='black', facecolor='white', zorder=1)
     ax.add_patch(concrete)
-    
+
     tie_ox = cover
     tie_oy = cover
     tie_ow = B - 2 * cover
@@ -273,13 +273,13 @@ with col2:
     tie_iy = cover + stirrup_dia
     tie_iw = B - 2 * (cover + stirrup_dia)
     tie_ih = D - 2 * (cover + stirrup_dia)
-    
+
     r = dia / 2.0
     x_min = tie_ix + r
     x_max = tie_ix + tie_iw - r
     y_min = tie_iy + r
     y_max = tie_iy + tie_ih - r
-    
+
     xs = np.linspace(x_min, x_max, Nx)
     ys = np.linspace(y_min, y_max, Ny)
 
@@ -328,7 +328,7 @@ with col2:
     for y in ys[1:-1]:
         stations.append((x_min, y, 'left'))
         stations.append((x_max, y, 'right'))
-        
+
     corners = [
         (x_min, y_min, 'corner_bl'),
         (x_max, y_min, 'corner_br'),
@@ -336,7 +336,7 @@ with col2:
         (x_max, y_max, 'corner_tr')
     ]
     stations.extend(corners)
-    
+
     diag_shift = dia / np.sqrt(2)
     sample_corner_bar = (x_max, y_max)
 
@@ -357,7 +357,7 @@ with col2:
                 c1, c2 = (x - r, y), (x + r, y)
             elif pos in ['left', 'right']:
                 c1, c2 = (x, y - r), (x, y + r)
-                
+
             ax.add_patch(patches.Circle(c1, r, facecolor='black', edgecolor='black', linewidth=1, zorder=5))
             ax.add_patch(patches.Circle(c2, r, facecolor='black', edgecolor='black', linewidth=1, zorder=5))
 
@@ -408,6 +408,6 @@ with col2:
     ax.set_ylim(-D * 0.10, D * 1.25)
     ax.set_aspect('equal')
     ax.axis('off')
-    
+
     st.pyplot(fig)
-    plt.close(fig)  # Crucial to release thread memory
+    plt.close(fig)
